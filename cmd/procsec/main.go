@@ -42,6 +42,10 @@ func main() {
 		err = cmdMaps(os.Args[2:])
 	case "fds":
 		err = cmdFDs(os.Args[2:])
+	case "net":
+		err = cmdNet(os.Args[2:])
+	case "investigate":
+		err = cmdInvestigate(os.Args[2:])
 	case "environ":
 		err = cmdEnviron(os.Args[2:])
 	case "ns":
@@ -82,26 +86,35 @@ func main() {
 func printUsage() {
 	fmt.Fprintln(os.Stderr, output.Bold("procsec")+" — Linux /proc-based process security explorer\n\n"+`Usage:
   procsec ps [--json] [--risk]                    List all processes (--risk adds a heuristic score column)
-    [--user U] [--name S] [--state Z]             Filter by owner/name-or-cmdline-substring/state letter
+    [--user U] [--name S] [--state Z]             Filter by owner/name-or-cmdline-substring/state
+    [--type T] [--kernel] [--user-process]        Filter by process type
   procsec inspect <PID> [--json]                  Combined process detail view
-  procsec tree                                    Process ancestry tree
+  procsec investigate <PID>                       Everything about one process: inspect + sockets + fds
+  procsec tree [--pid P] [--user U] [--security]  Process ancestry tree (subtree/filtered/risk-annotated)
   procsec top                                     Live auto-refreshing dashboard (like top, security-focused)
   procsec watch [--no-context] [--baseline F]     Live create/exit/context-change monitor
+    [--verbose] [--security] [--log FILE]         Verbose blocks / context-changes-only / JSONL logging
+    [--user U] [--exclude-kernel] [--exe S]       Filter which processes generate events
   procsec maps <PID>                              Memory mapping analysis
-  procsec fds <PID>                                File descriptor analysis
+  procsec fds <PID>                               File descriptor analysis (sockets show endpoint+state)
+  procsec net [PID]                               Network sockets (system-wide, or one process's)
   procsec environ <PID> [--reveal]                Environment variables (sensitive values masked by default)
-  procsec ns <PID> [PID2]                          Namespace analysis (or diff two PIDs)
-  procsec cgroup <PID>                             Cgroup membership
-  procsec caps <PID>                               Capability decoding
-  procsec security <PID> [--json]                  Combined security profile
-  procsec system [--json]                          System summary (active LSMs, process count)
-  procsec zombies                                  Shortcut: list zombie (defunct) processes
-  procsec root [--risk]                            Shortcut: list processes running as root
-  procsec snapshot <file>                          Save current process state for later comparison
-  procsec diff <file>                              Compare live state against a saved snapshot
+  procsec ns <PID> [PID2]                         Namespace analysis (or diff two PIDs)
+  procsec cgroup <PID>                            Cgroup membership
+  procsec caps <PID>                              Capability decoding
+  procsec security <PID> [--json]                 Combined security profile
+  procsec system [--json]                         System summary (active LSMs, process count)
+  procsec zombies                                 Shortcut: list zombie (defunct) processes
+  procsec root [--risk]                           Shortcut: list processes running as root
+  procsec snapshot <file>                         Save current process state for later comparison
+  procsec diff <file>                             Compare live state against a saved snapshot
 
 Global flags:
-  --no-color                                       Disable colored output (also respects NO_COLOR env var)`)
+  --no-color                                      Disable colored output (also respects NO_COLOR env var)
+
+Notes:
+  Risk scores are N/A for kernel threads (root/full-caps is structurally
+  normal for them, not a security signal) — see README for details.`)
 }
 
 func parsePID(args []string) (int, []string, error) {
@@ -171,6 +184,15 @@ func cmdPS(args []string) error {
 	}
 	if v, ok := flagValue(args, "--state"); ok {
 		f.State = v
+	}
+	if v, ok := flagValue(args, "--type"); ok {
+		f.Type = proc.ProcType(v)
+	}
+	if hasFlag(args, "--kernel") {
+		f.Type = proc.TypeKernelThread
+	}
+	if hasFlag(args, "--user-process") {
+		f.Type = proc.TypeUserProcess
 	}
 	f.ResolveUser()
 	procs = f.Apply(procs)
@@ -270,6 +292,64 @@ func cmdInspect(args []string) error {
 	return nil
 }
 
+// --- investigate ---
+
+// cmdInvestigate is the "everything about one process, in one shot"
+// command: inspect's full profile plus network sockets, open file
+// descriptors, and (names only) sensitive environment variables —
+// the complete picture a real investigation on a CTF/pentest box
+// needs, without chaining five separate commands by hand.
+func cmdInvestigate(args []string) error {
+	pid, _, err := parsePID(args)
+	if err != nil {
+		return err
+	}
+
+	p, err := proc.ReadProcess(pid)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(output.Bold(fmt.Sprintf("=== Investigating PID %d ===", pid)))
+	sp := output.BuildSecurityProfile(p)
+	output.PrintSecurityProfile(os.Stdout, sp)
+
+	all, _ := proc.ReadAll()
+	if ancestors := proc.Ancestors(all, pid); len(ancestors) > 0 {
+		fmt.Println("\n  " + output.Bold("Ancestry (immediate parent first):"))
+		for _, a := range ancestors {
+			fmt.Printf("    %d %s (uid=%d)\n", a.PID, a.Name, a.UID)
+		}
+	}
+
+	if ns, err := proc.ReadNamespaces(pid); err == nil {
+		fmt.Println("\n  " + output.Bold("Namespaces:"))
+		for t, id := range ns {
+			fmt.Printf("    %-18s %d\n", t, id)
+		}
+	}
+
+	if cg, err := proc.ReadCgroups(pid); err == nil && len(cg) > 0 {
+		fmt.Println("\n  " + output.Bold("Cgroup:"))
+		output.PrintCgroups(os.Stdout, cg)
+	}
+
+	if sockets, err := proc.ReadSockets(); err == nil {
+		if procSockets := proc.ProcessSockets(pid, sockets); len(procSockets) > 0 {
+			fmt.Println("\n  " + output.Bold("Network sockets:"))
+			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			output.PrintSockets(w, procSockets, nil)
+			w.Flush()
+		}
+	}
+
+	if fds, err := proc.ReadFDs(pid); err == nil {
+		fmt.Printf("\n  %s %d open (see `procsec fds %d` for full listing)\n", output.Bold("File descriptors:"), len(fds), pid)
+	}
+
+	return nil
+}
+
 // --- tree ---
 
 func cmdTree(args []string) error {
@@ -277,9 +357,58 @@ func cmdTree(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	if v, ok := flagValue(args, "--pid"); ok {
+		pid, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid PID %q: %w", v, err)
+		}
+		node := proc.SubtreeAt(procs, pid)
+		if node == nil {
+			return fmt.Errorf("pid %d not found (may have exited)", pid)
+		}
+		output.PrintTree(os.Stdout, []*proc.TreeNode{node})
+		return nil
+	}
+
+	if v, ok := flagValue(args, "--user"); ok {
+		f := proc.Filter{User: v}
+		f.ResolveUser()
+		if f.UID == nil {
+			return fmt.Errorf("unknown user %q", v)
+		}
+		// Build the tree from the FULL process list (so ancestry stays
+		// correct — a matched process's parent might not itself match
+		// the filter) then prune to only roots/branches that lead to
+		// at least one matching process.
+		roots := proc.BuildTree(procs)
+		roots = pruneTreeToUID(roots, *f.UID)
+		output.PrintTree(os.Stdout, roots)
+		return nil
+	}
+
 	roots := proc.BuildTree(procs)
+	if hasFlag(args, "--security") {
+		output.PrintTreeSecurity(os.Stdout, roots)
+		return nil
+	}
 	output.PrintTree(os.Stdout, roots)
 	return nil
+}
+
+// pruneTreeToUID keeps only nodes owned by uid, or that have at
+// least one descendant owned by uid (so ancestry context isn't lost
+// — e.g. `tree --user root` still shows the non-root parent that
+// spawned a root child, which is often exactly the interesting part).
+func pruneTreeToUID(nodes []*proc.TreeNode, uid int) []*proc.TreeNode {
+	var out []*proc.TreeNode
+	for _, n := range nodes {
+		n.Children = pruneTreeToUID(n.Children, uid)
+		if n.Process.UID == uid || len(n.Children) > 0 {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // --- top ---
@@ -317,7 +446,7 @@ func renderTop() {
 		risk security.RiskScore
 	}
 	scoredList := make([]scored, 0, len(procs))
-	rootCount, zombieCount := 0, 0
+	rootCount, zombieCount, kernelCount := 0, 0, 0
 	for _, p := range procs {
 		if p.UID == 0 {
 			rootCount++
@@ -325,12 +454,18 @@ func renderTop() {
 		if p.State == "Z" {
 			zombieCount++
 		}
+		ptype := proc.Classify(p)
+		if ptype == proc.TypeKernelThread {
+			kernelCount++
+			continue // never scored, never shown in the risk list — see security/risk.go
+		}
 		extra, err := proc.ReadStatusExtra(p.PID)
 		if err != nil {
 			continue
 		}
 		capEff := security.DecodeCapabilities(extra.CapEff)
 		rs := security.ScoreProcess(security.RiskInputs{
+			ProcType:        string(ptype),
 			UID:             p.UID,
 			RunningAsRoot:   p.UID == 0,
 			FullCapSet:      security.HasFullCapabilitySet(extra.CapEff),
@@ -350,10 +485,10 @@ func renderTop() {
 		fmt.Print("\033[H\033[2J")
 	}
 	fmt.Printf("%s  %s\n", output.Bold("procsec top"), output.Dim(time.Now().Format("15:04:05")))
-	fmt.Printf("processes: %d   %s: %d   %s: %d\n\n",
-		len(procs), output.Red("root-owned"), rootCount, output.BoldRed("zombies"), zombieCount)
+	fmt.Printf("processes: %d   %s: %d   kernel: %d   %s: %d\n\n",
+		len(procs), output.Red("root-owned"), rootCount, kernelCount, output.BoldRed("zombies"), zombieCount)
 
-	fmt.Println(output.Bold("Top by risk score:"))
+	fmt.Println(output.Bold("Top by risk score (kernel threads excluded — see docs):"))
 	limit := 10
 	if len(scoredList) < limit {
 		limit = len(scoredList)
@@ -364,7 +499,7 @@ func renderTop() {
 	for i := 0; i < limit; i++ {
 		s := scoredList[i]
 		color := output.SeverityColor(s.risk.Score)
-		fmt.Printf("  %s  %-20s %s\n", color(fmt.Sprintf("[%3d]", s.risk.Score)), fmt.Sprintf("%s(%d)", s.p.Name, s.p.PID), output.Dim(joinReasons(s.risk.Reasons)))
+		fmt.Printf("  %s  %-20s %s\n", color(fmt.Sprintf("[%3d]", s.risk.Score)), fmt.Sprintf("%s(%d)", s.p.Name, s.p.PID), output.Dim(joinReasons(s.risk.ReasonTexts())))
 	}
 	fmt.Println(output.Dim("\nCtrl+C to exit"))
 }
@@ -445,6 +580,22 @@ func cmdWatch(args []string) error {
 	if hasFlag(args, "--no-context") {
 		w.DeepCheckInterval = 0
 	}
+	if hasFlag(args, "--exclude-kernel") {
+		w.Filter.ExcludeKernel = true
+	}
+	if v, ok := flagValue(args, "--user"); ok {
+		f := proc.Filter{User: v}
+		f.ResolveUser()
+		if f.UID != nil {
+			w.Filter.UID = f.UID
+		}
+	}
+	if v, ok := flagValue(args, "--exe"); ok {
+		w.Filter.Exe = v
+	}
+
+	verbose := hasFlag(args, "--verbose")
+	securityMode := hasFlag(args, "--security")
 
 	if path, ok := flagValue(args, "--baseline"); ok {
 		baseline, err := proc.LoadSnapshot(path)
@@ -460,6 +611,16 @@ func cmdWatch(args []string) error {
 		fmt.Println()
 	}
 
+	var logFile *os.File
+	if path, ok := flagValue(args, "--log"); ok {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return fmt.Errorf("opening log file: %w", err)
+		}
+		defer f.Close()
+		logFile = f
+	}
+
 	events := make(chan monitor.Event, 256)
 	stop := make(chan struct{})
 
@@ -472,12 +633,43 @@ func cmdWatch(args []string) error {
 	for {
 		select {
 		case ev := <-events:
-			output.PrintWatchEvent(os.Stdout, ev)
+			// security mode only shows context-change events (the
+			// flagship signal); normal/verbose mode shows everything.
+			if securityMode && ev.Kind != monitor.EventContextChanged {
+				if logFile != nil {
+					writeEventJSONL(logFile, ev)
+				}
+				continue
+			}
+			switch {
+			case securityMode:
+				output.PrintWatchEventSecurity(os.Stdout, ev)
+			case verbose:
+				output.PrintWatchEventVerbose(os.Stdout, ev)
+			default:
+				output.PrintWatchEvent(os.Stdout, ev)
+			}
+			if logFile != nil {
+				writeEventJSONL(logFile, ev)
+			}
 		case <-sigs:
 			close(stop)
 			return nil
 		}
 	}
+}
+
+// writeEventJSONL appends one JSON-encoded event line to the watch
+// log file, per the design doc's JSONL event-logging feature. Kept
+// as a plain append rather than buffered so a killed/crashed process
+// doesn't lose already-written events.
+func writeEventJSONL(f *os.File, ev monitor.Event) {
+	line, err := output.EventToJSONLine(ev)
+	if err != nil {
+		return
+	}
+	f.Write(line)
+	f.Write([]byte("\n"))
 }
 
 // --- maps ---
@@ -511,7 +703,68 @@ func cmdFDs(args []string) error {
 	if err != nil {
 		return err
 	}
-	output.PrintFDs(os.Stdout, fds)
+	// Best-effort: if we can't read /proc/net (unusual, but possible
+	// in a heavily locked-down environment), fds still render with
+	// bare socket:[inode] targets rather than failing the command.
+	sockets, _ := proc.ReadSockets()
+	output.PrintFDs(os.Stdout, fds, sockets)
+	return nil
+}
+
+// --- net ---
+
+// cmdNet implements `procsec net [PID]`. With a PID, shows just that
+// process's sockets (correlated via its fd table). Without one, shows
+// every socket on the system with its owning PID resolved — built by
+// scanning every process's fds once and inverting the inode->socket
+// map into an inode->PID map, rather than re-reading /proc/net per
+// process.
+func cmdNet(args []string) error {
+	sockets, err := proc.ReadSockets()
+	if err != nil {
+		return err
+	}
+
+	if len(args) > 0 {
+		pid, err := strconv.Atoi(args[0])
+		if err != nil {
+			return fmt.Errorf("invalid PID %q: %w", args[0], err)
+		}
+		procSockets := proc.ProcessSockets(pid, sockets)
+		output.PrintSockets(os.Stdout, procSockets, nil)
+		return nil
+	}
+
+	procs, err := proc.ReadAll()
+	if err != nil {
+		return err
+	}
+	targetToSocket := make(map[string]proc.Socket, len(sockets))
+	for _, s := range sockets {
+		targetToSocket[fmt.Sprintf("socket:[%d]", s.Inode)] = s
+	}
+	pidByInode := make(map[uint64]int)
+	for _, p := range procs {
+		fds, err := proc.ReadFDs(p.PID)
+		if err != nil {
+			continue
+		}
+		for _, fd := range fds {
+			if fd.Kind != proc.FDSocket {
+				continue
+			}
+			if s, ok := targetToSocket[fd.Target]; ok {
+				pidByInode[s.Inode] = p.PID
+			}
+		}
+	}
+
+	all := make([]proc.Socket, 0, len(sockets))
+	for _, s := range sockets {
+		all = append(all, s)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].LocalPort < all[j].LocalPort })
+	output.PrintSockets(os.Stdout, all, pidByInode)
 	return nil
 }
 

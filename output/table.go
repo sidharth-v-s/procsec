@@ -15,7 +15,7 @@ import (
 // Root-owned rows are highlighted (bold red PID) so a scroll through a
 // long process list draws the eye to privileged processes first.
 func PrintProcessTable(w *tabwriter.Writer, procs []*proc.Process) {
-	fmt.Fprintln(w, Bold("PID\tUSER\tNAME\tSTATE\tEXE"))
+	fmt.Fprintln(w, Bold("PID\tUSER\tTYPE\tNAME\tSTATE\tEXE"))
 	for _, p := range procs {
 		exe := p.Exe
 		if exe == "" {
@@ -27,8 +27,8 @@ func PrintProcessTable(w *tabwriter.Writer, procs []*proc.Process) {
 			pidStr = BoldRed(pidStr)
 			userStr = Red(userStr)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-			pidStr, userStr, p.Name, colorState(p.State), exe)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			pidStr, userStr, colorType(proc.Classify(p)), p.Name, colorState(p.State), exe)
 	}
 }
 
@@ -36,8 +36,10 @@ func PrintProcessTable(w *tabwriter.Writer, procs []*proc.Process) {
 // for `procsec ps --risk` — computes a lightweight score per process
 // from just its capabilities/hardening (no memory-map read, to keep
 // a full-table pass cheap; use `inspect` for the complete picture).
+// Kernel threads show N/A rather than a misleadingly high score —
+// see security/risk.go's IsScorable for why.
 func PrintProcessTableWithRisk(w *tabwriter.Writer, procs []*proc.Process) {
-	fmt.Fprintln(w, Bold("PID\tUSER\tNAME\tSTATE\tRISK\tEXE"))
+	fmt.Fprintln(w, Bold("PID\tUSER\tTYPE\tNAME\tSTATE\tRISK\tEXE"))
 	for _, p := range procs {
 		exe := p.Exe
 		if exe == "" {
@@ -50,24 +52,29 @@ func PrintProcessTableWithRisk(w *tabwriter.Writer, procs []*proc.Process) {
 			userStr = Red(userStr)
 		}
 
-		risk := quickRisk(p)
+		ptype := proc.Classify(p)
+		risk := quickRisk(p, ptype)
 		riskStr := colorRiskLabel(risk)
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			pidStr, userStr, p.Name, colorState(p.State), riskStr, exe)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			pidStr, userStr, colorType(ptype), p.Name, colorState(p.State), riskStr, exe)
 	}
 }
 
 // quickRisk computes a RiskScore using only cheap-to-read signals
 // (status caps/hardening), skipping the memory-map scan that a full
 // `inspect` does — keeps `ps --risk` fast across hundreds of PIDs.
-func quickRisk(p *proc.Process) security.RiskScore {
+func quickRisk(p *proc.Process, ptype proc.ProcType) security.RiskScore {
+	if !security.IsScorable(string(ptype)) {
+		return security.RiskScore{Applicable: false}
+	}
 	extra, err := proc.ReadStatusExtra(p.PID)
 	if err != nil {
-		return security.RiskScore{}
+		return security.RiskScore{Applicable: false}
 	}
 	capEff := security.DecodeCapabilities(extra.CapEff)
 	in := security.RiskInputs{
+		ProcType:        string(ptype),
 		UID:             p.UID,
 		RunningAsRoot:   p.UID == 0,
 		FullCapSet:      security.HasFullCapabilitySet(extra.CapEff),
@@ -80,10 +87,24 @@ func quickRisk(p *proc.Process) security.RiskScore {
 
 func colorRiskLabel(rs security.RiskScore) string {
 	label := rs.Label()
-	if label == "-" {
+	if label == "-" || label == "N/A" {
 		return Dim(label)
 	}
 	return SeverityColor(rs.Score)(label)
+}
+
+// colorType tints a process type label — kernel threads dimmed since
+// they're rarely the point of an investigation, daemons/interactive
+// in default color, unknown dimmed as well.
+func colorType(t proc.ProcType) string {
+	switch t {
+	case proc.TypeKernelThread:
+		return Dim(string(t))
+	case proc.TypeUnknown:
+		return Dim(string(t))
+	default:
+		return string(t)
+	}
 }
 
 // colorState tints a process state letter: red for zombie (Z), green

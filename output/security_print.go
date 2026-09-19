@@ -13,24 +13,14 @@ import (
 // colorized report: green checkmarks for hardening that's present,
 // red bangs for concerning signals, and an overall risk score banner
 // at the top so the operator's eye lands on the verdict first.
+// Reasons are always shown (design doc: never a black box) rather
+// than gated behind a separate --explain flag.
 func PrintSecurityProfile(w io.Writer, sp SecurityProfile) {
 	p := sp.Process
+	rs := sp.Risk
 
-	rs := security.ScoreProcess(security.RiskInputs{
-		UID:              p.UID,
-		RunningAsRoot:    p.UID == 0,
-		FullCapSet:       sp.FullCapSet,
-		InterestingCaps:  sp.InterestingCap,
-		NoNewPrivs:       sp.NoNewPrivs,
-		SeccompEnabled:   sp.Seccomp != "disabled",
-		LSMConfined:      sp.LSM.Module != "" && sp.LSM.Context != "unconfined",
-		RWXMappings:      rwxCount(sp),
-		AnonExecMappings: anonExecCount(sp),
-		SensitiveEnvVars: len(sp.SensitiveEnv),
-	})
-
-	fmt.Fprintf(w, "%s %s  %s\n", Bold(fmt.Sprintf("PID %d", p.PID)), Dim("("+p.Name+")"), Dim(fmt.Sprintf("ppid=%d", p.PPID)))
-	fmt.Fprintf(w, "  risk: %s %s\n", riskBadge(rs), Dim(strings.Join(rs.Reasons, "; ")))
+	fmt.Fprintf(w, "%s %s  %s  %s\n", Bold(fmt.Sprintf("PID %d", p.PID)), Dim("("+p.Name+")"), Dim(fmt.Sprintf("ppid=%d", p.PPID)), Dim("type="+p.Type))
+	printRiskLine(w, rs)
 	fmt.Fprintf(w, "  exe:     %s\n", orDash(p.Exe))
 	fmt.Fprintf(w, "  cmdline: %s\n", FormatCmdline(p.Name, p.Cmdline))
 	uidStr := fmt.Sprintf("uid=%d gid=%d", p.UID, p.GID)
@@ -84,6 +74,52 @@ func PrintSecurityProfile(w io.Writer, sp SecurityProfile) {
 		fmt.Fprintln(w, "\n  "+Bold("Environment:"))
 		fmt.Fprintln(w, "    "+Warn("sensitive-looking vars (names only): "+strings.Join(sp.SensitiveEnv, ", ")))
 	}
+
+	printAccessibility(w, sp.Access)
+}
+
+// printRiskLine renders the risk badge plus, if the score is
+// applicable, every contributing reason with its point value —
+// "never a black box" per the design doc. Kernel threads show a
+// dimmed N/A line with a one-line explanation instead of a score.
+func printRiskLine(w io.Writer, rs security.RiskScore) {
+	if !rs.Applicable {
+		fmt.Fprintln(w, "  risk: "+Dim("[N/A] kernel thread — not scored (root/full-caps is normal for kernel threads)"))
+		return
+	}
+	fmt.Fprintf(w, "  risk: %s\n", riskBadge(rs))
+	for _, r := range rs.Reasons {
+		fmt.Fprintf(w, "        %s\n", Dim(fmt.Sprintf("+%-3d %s", r.Points, r.Text)))
+	}
+	if len(rs.Reasons) == 0 {
+		fmt.Fprintln(w, "        "+Dim("no risk signals present"))
+	}
+}
+
+// printAccessibility reports which /proc sources were and weren't
+// readable for this process, explicitly — per the design doc's
+// principle of representing inaccessibility rather than silently
+// omitting sections. Only prints sources that AREN'T cleanly
+// readable, so a fully-accessible process (the common case when
+// running as root) doesn't clutter output with all-green noise.
+func printAccessibility(w io.Writer, a proc.Accessibility) {
+	type entry struct {
+		label string
+		state proc.AccessState
+	}
+	entries := []entry{
+		{"environ", a.Environ}, {"maps", a.Maps}, {"smaps", a.Smaps},
+		{"fds", a.FDs}, {"namespaces", a.NS}, {"cgroup", a.Cgroup},
+	}
+	var restricted []string
+	for _, e := range entries {
+		if e.state != proc.Readable {
+			restricted = append(restricted, fmt.Sprintf("%s (%s)", e.label, e.state))
+		}
+	}
+	if len(restricted) > 0 {
+		fmt.Fprintln(w, "\n  "+Dim("Not fully accessible: "+strings.Join(restricted, ", ")))
+	}
 }
 
 func printHardeningLine(w io.Writer, label string, on bool) {
@@ -101,20 +137,6 @@ func riskBadge(rs security.RiskScore) string {
 	}
 	color := SeverityColor(rs.Score)
 	return color(fmt.Sprintf("[%s %d/100]", label, rs.Score))
-}
-
-func rwxCount(sp SecurityProfile) int {
-	if sp.MapSummary == nil {
-		return 0
-	}
-	return sp.MapSummary.RWX
-}
-
-func anonExecCount(sp SecurityProfile) int {
-	if sp.MapSummary == nil {
-		return 0
-	}
-	return sp.MapSummary.AnonymousExec
 }
 
 // memBar renders a compact colored bar summarizing a process's

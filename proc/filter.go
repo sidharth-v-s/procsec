@@ -9,10 +9,12 @@ import (
 // Filter narrows a process list. Zero-value fields are "don't filter
 // on this dimension" — an empty Filter matches everything.
 type Filter struct {
-	Name  string // substring match against Name or Cmdline, case-insensitive
-	User  string // username or numeric UID
-	State string // exact state letter, e.g. "Z" for zombies
-	UID   *int   // set internally by ResolveUser; nil means unset
+	Name          string   // substring match against Name or Cmdline, case-insensitive
+	User          string   // username or numeric UID
+	State         string   // exact state letter, e.g. "Z" for zombies
+	UID           *int     // set internally by ResolveUser; nil means unset
+	Type          ProcType // exact process type, e.g. TypeKernelThread
+	ExcludeKernel bool     // shortcut equivalent to excluding TypeKernelThread
 }
 
 // ResolveUser fills f.UID from f.User (accepting either a username
@@ -36,7 +38,7 @@ func (f *Filter) ResolveUser() {
 // Apply returns the subset of procs matching every set dimension of
 // f (AND semantics across dimensions).
 func (f Filter) Apply(procs []*Process) []*Process {
-	if f.Name == "" && f.UID == nil && f.State == "" {
+	if f.Name == "" && f.UID == nil && f.State == "" && f.Type == "" && !f.ExcludeKernel {
 		return procs
 	}
 
@@ -55,6 +57,15 @@ func (f Filter) Apply(procs []*Process) []*Process {
 		}
 		if f.State != "" && p.State != f.State {
 			continue
+		}
+		if f.Type != "" || f.ExcludeKernel {
+			t := Classify(p)
+			if f.Type != "" && t != f.Type {
+				continue
+			}
+			if f.ExcludeKernel && t == TypeKernelThread {
+				continue
+			}
 		}
 		out = append(out, p)
 	}

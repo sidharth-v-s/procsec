@@ -41,7 +41,26 @@ func sortTree(nodes []*TreeNode) {
 	}
 }
 
-// Ancestors walks up from pid to PID 1 using the byPID lookup built
+// SubtreeAt returns the TreeNode for pid and everything beneath it,
+// built from the full process list so ancestry/descendant
+// relationships are correct even when pid isn't a top-level root.
+// Returns nil if pid isn't present in procs (e.g. it already exited).
+func SubtreeAt(procs []*Process, pid int) *TreeNode {
+	byPID := make(map[int]*TreeNode, len(procs))
+	for _, p := range procs {
+		byPID[p.PID] = &TreeNode{Process: p}
+	}
+	for _, p := range procs {
+		if parent, ok := byPID[p.PPID]; ok && p.PPID != p.PID {
+			parent.Children = append(parent.Children, byPID[p.PID])
+		}
+	}
+	for _, node := range byPID {
+		sortTree(node.Children)
+	}
+	return byPID[pid]
+}
+
 // from procs, returning the chain from immediate parent to root.
 // Used for `procsec inspect` to show "who spawned this and from
 // where" (design doc: ancestry chain, common for spotting a shell

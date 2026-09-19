@@ -13,6 +13,20 @@ Built for red teaming / CTF / Linux privilege-escalation work: fast triage of "w
 
 ---
 
+## What's new: reliability + investigation features
+
+On top of the original feature set, this pass focused on two things the roadmap flagged as the highest-value next steps:
+
+- **Process classification** (`kernel-thread` / `daemon` / `interactive` / `user-process`). Kernel threads are root with a full capability set and no seccomp as a matter of course — that's not a security signal, it's just what a kernel thread is. Risk scoring now skips them entirely (`N/A` instead of a misleading score), so `ps --risk`/`top` surface processes actually worth a look instead of a wall of `kworker/*` noise.
+- **`procsec net [PID]`** — network socket correlation. Cross-references `/proc/net/{tcp,tcp6,udp,udp6}` against a process's open file descriptors (which reference sockets by inode) to show exactly which local/remote endpoints belong to which process, unprivileged. `fds` now annotates socket entries with their resolved endpoint too.
+- **`procsec investigate <PID>`** — the "give me everything" command: the full `inspect` security profile plus correlated sockets and fd summary, in one shot.
+- **`watch --verbose` / `--security` / `--log FILE`** — verbose per-event detail blocks, a security-events-only mode, and JSONL event logging with a stable schema for feeding into other tooling. `watch` also now detects network-namespace, seccomp-mode, and `no_new_privs` changes on a still-running PID, not just UID/GID/exe/capabilities.
+- **`tree --pid/--user/--security`** — subtree-from-PID, filtered-to-owner (with ancestry preserved), and risk-badge-annotated tree views.
+- **Explicit accessibility reporting** — `inspect`/`security` now say which `/proc` sources were readable, permission-denied, or gone, instead of silently blank sections.
+- Every risk score line now always shows its full reasoning (point values + text), not just a number.
+
+---
+
 ## Table of contents
 
 - [Why this exists](#why-this-exists)
@@ -156,7 +170,7 @@ Requires Go 1.22+. No external Go modules — the entire project is standard lib
 ## Command reference
 
 ```
-procsec ps [--json] [--risk] [--user U] [--name S] [--state Z]
+procsec ps [--json] [--risk] [--user U] [--name S] [--state Z] [--type T] [--kernel] [--user-process]
 ```
 List all processes. `--risk` adds a heuristic risk score column. `--user`/`--name`/`--state` filter (AND semantics across all three). `--name` matches against both the process name and its full cmdline, case-insensitive.
 
@@ -166,9 +180,19 @@ procsec inspect <PID> [--json]
 The combined detail view for one process: security profile (capabilities, hardening, LSM, memory summary), ancestry chain, namespaces, cgroup membership. This is usually where you end up after `ps --risk` points you at something.
 
 ```
-procsec tree
+procsec investigate <PID>
 ```
-ASCII process ancestry tree, root-owned processes highlighted.
+Everything: `inspect`'s full profile plus correlated network sockets and an fd count, in one shot. The command to reach for when you've found something and want the complete picture without chaining five commands together.
+
+```
+procsec tree [--pid PID] [--user U] [--security]
+```
+ASCII process ancestry tree, root-owned processes highlighted. `--pid` shows only the subtree rooted at that PID. `--user` filters to processes owned by that user, keeping enough ancestry context to show how they were spawned. `--security` annotates each node with its risk badge inline.
+
+```
+procsec net [PID]
+```
+Network sockets, correlated from `/proc/net/{tcp,tcp6,udp,udp6}` against process file descriptors — unprivileged, no `ss`/`netstat`/root required. With a PID, shows just that process's sockets. Without one, shows every socket on the system with its owning PID resolved.
 
 ```
 procsec top
@@ -176,9 +200,17 @@ procsec top
 Live-refreshing security dashboard. Process/root/zombie counts plus the top 10 processes by risk score, redrawn in place every second. `Ctrl+C` to exit.
 
 ```
-procsec watch [--no-context] [--baseline FILE]
+procsec watch [--no-context] [--baseline FILE] [--verbose] [--security] [--log FILE]
+  [--user U] [--exclude-kernel] [--exe SUBSTR]
 ```
-Live process monitor, pspy-style: reports every process start and exit as it happens (100ms poll interval by default). Also detects **security-context changes** on still-running PIDs — a UID/GID/exe/capability change on a process that doesn't exit and restart — gated behind a 2-second-per-PID deep-check interval so it doesn't re-read capability data on every single poll tick for every process. `--no-context` disables context-change detection entirely, for pure start/exit watching. `--baseline FILE` compares current state against a saved snapshot before entering the live loop (see [Snapshot / baseline diffing](#snapshot--baseline-diffing)).
+Live process monitor, pspy-style: reports every process start and exit as it happens (100ms poll interval by default). Also detects **security-context changes** on still-running PIDs — UID, GID, exe, effective capabilities, network namespace, seccomp mode, or `no_new_privs` changing on a process that doesn't exit and restart — gated behind a 2-second-per-PID deep-check interval so it doesn't re-read that data on every single poll tick for every process.
+
+- `--no-context` disables context-change detection entirely, for pure start/exit watching.
+- `--verbose` prints a multi-line detail block per event instead of the compact single-line form.
+- `--security` shows *only* context-change events, in a full labeled block — use this when you specifically want the highest-signal event kind without start/exit noise.
+- `--log FILE` appends every event as a JSON Lines record to FILE (schema below), independent of whatever's printed to the terminal.
+- `--user`/`--exclude-kernel`/`--exe` filter which processes generate events at all, applied before any event is emitted — useful for cutting noise on a busy box (`--exclude-kernel` in particular, since kernel thread churn is otherwise most of a poll-based watcher's output).
+- `--baseline FILE` compares current state against a saved snapshot before entering the live loop (see [Snapshot / baseline diffing](#snapshot--baseline-diffing)).
 
 ```
 procsec maps <PID>
@@ -188,7 +220,7 @@ Full memory mapping table plus an `smaps`-derived summary (RSS, PSS, anonymous/l
 ```
 procsec fds <PID>
 ```
-File descriptor table, classified by kind (socket/pipe/regular/device), with resolved targets.
+File descriptor table, classified by kind (socket/pipe/regular/device). Socket fds are resolved to their actual local/remote endpoint and connection state (via the same correlation `net` uses) instead of a bare `socket:[inode]`.
 
 ```
 procsec environ <PID> [--reveal]
@@ -267,7 +299,7 @@ Every process gets an additive 0–100 score built purely from signals `procsec`
 | Full capability set (nothing dropped) | +20 |
 | Holds high-impact capabilities (`cap_setuid`, `cap_sys_admin`, `cap_sys_ptrace`, etc.) | up to +20 |
 | `no_new_privs` not set | +5 |
-| No seccomp filtering | +5 |
+| No seccomp filtering | +10 |
 | No LSM confinement detected | +5 |
 | Writable+executable (RWX) memory present | +20 |
 | Anonymous executable memory present | +15 |
@@ -276,6 +308,17 @@ Every process gets an additive 0–100 score built purely from signals `procsec`
 Every score comes with the list of reasons that produced it, printed alongside — `ps --risk`, `root --risk`, `inspect`, `security`, and `top` all show the reasoning, not just the number. This is a **triage aid**, not a verdict: it tells you where to look first on a box with hundreds of processes, not whether something is actually exploitable. That judgment is still yours — see [What it is *not*](#what-it-is-not).
 
 ---
+
+## Watch event schema (JSONL)
+
+`watch --log FILE` appends one JSON object per line (JSON Lines format) for every event, whatever's also being printed to the terminal:
+
+```json
+{"timestamp":"2026-09-19T03:23:18.470Z","event":"process_start","pid":1234,"ppid":1,"uid":0,"gid":0,"name":"nc","exe":"/usr/bin/nc","type":"user-process"}
+{"timestamp":"2026-09-19T03:23:20.100Z","event":"security_context_change","pid":1234,"ppid":1,"uid":0,"gid":0,"name":"nc","type":"user-process","changes":{"uid":{"old":"1000","new":"0"}}}
+```
+
+`event` is one of `process_start`, `process_exit`, `security_context_change`. `changes` is only present on context-change events, keyed by field name (`uid`, `gid`, `exe`, `cap_eff`, `netns`, `seccomp`, `no_new_privs`).
 
 ## JSON output
 
@@ -379,18 +422,18 @@ Dependency direction is strictly one-way: `proc` and `security` know nothing abo
 - **No eBPF/netlink.** `watch` is purely poll-based (default 100ms interval). This is a deliberate simplicity/portability tradeoff — eBPF requires kernel support and elevated privileges that aren't guaranteed on a CTF box, whereas polling `/proc` works everywhere, unprivileged, out of the box. A sufficiently fast process (spawns and exits well under 100ms) can theoretically be missed, though in practice this interval catches the overwhelming majority of short-lived processes.
 - **LSM detection is a heuristic.** There is no single portable Linux API to ask "which LSM confines this specific PID" — `procsec` infers AppArmor vs SELinux from the shape of `/proc/<pid>/attr/current`, which is reliable in practice but not authoritative.
 - **Risk scoring is a triage aid, not a verdict.** It tells you where to look first, not whether something is actually exploitable. See [Risk scoring](#risk-scoring--how-it-works) and [What it is *not*](#what-it-is-not).
-- **No network socket correlation yet.** `fds` classifies socket file descriptors but doesn't currently cross-reference them against `/proc/net/tcp`/`udp` to show which port/connection a given fd corresponds to. On the roadmap.
 - **No automated test suite yet.** The project has been verified through extensive manual testing against a live `/proc`, but doesn't yet have `_test.go` coverage for the parsers. Also on the roadmap.
 
 ---
 
 ## Roadmap
 
-- [ ] Network socket correlation (`/proc/net/tcp[6]`/`udp[6]` inode cross-referencing with `fds`)
 - [ ] Test suite for the `proc/` parsers
 - [ ] Shell completion (bash/zsh)
 - [ ] Risk-score threshold filter on `watch` (`--min-risk N`) to cut noise on busy systems
 - [ ] Seccomp filter disassembly (beyond just mode detection)
+- [ ] Two-file `snapshot diff` (compare two saved snapshots against each other, not just live-vs-saved)
+- [ ] Performance tiering — skip expensive per-process reads (`smaps`, `environ`) during fast polling loops unless specifically requested
 
 ---
 
